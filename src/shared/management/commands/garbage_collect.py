@@ -105,7 +105,8 @@ class Command(BaseCommand):
                 | Q(
                     cve__date_published__isnull=True,
                     cve__date_reserved__lt=cutoff,
-                ),
+                )
+                | Q(derivations__isnull=True),
             )
             .filter(
                 status=CVEDerivationClusterProposal.Status.PENDING,
@@ -167,29 +168,43 @@ class Command(BaseCommand):
 
         candidates = failed_crashed | completed_unmatched
 
-        meta_ids = list(
-            candidates.filter(metadata__isnull=False).values_list(
-                "metadata_id", flat=True
+        self._delete_derivations_with_metadata(candidates, batch_size, dry_run)
+
+    def _delete_derivations_with_metadata(
+        self, qs: QuerySet, batch_size: int, dry_run: bool
+    ) -> None:
+        """
+        Deletes derivations metadatas, fetching only
+        `batch_size` (id, metadata_id) pairs at a time. `qs` can be unbounded in size (e.g.
+        once the cutoff no longer gates it), so metadata ids must never be collected for the
+        whole queryset up front — that would load the entire candidate set into memory.
+        """
+        total = qs.count()
+        self.stdout.write(f"Found {total} eligible derivations.")
+
+        if total == 0 or dry_run:
+            return
+
+        deleted_metas = 0
+        batch_num = 1
+
+        while True:
+            batch = qs.filter(metadata__isnull=False).values_list("id", "metadata_id")[:batch_size]
+            if not batch:
+                break
+
+            meta_ids = [meta_id for _, meta_id in batch if meta_id is not None]
+
+            meta_deleted, _ = NixDerivationMeta.objects.filter(pk__in=meta_ids).delete()
+            deleted_metas += meta_deleted
+
+            self.stdout.write(
+                f"Batch {batch_num}: Deleted ({deleted_metas} derivation metas)."
             )
-        )
+            batch_num += 1
 
-        self._delete_in_batches(
-            qs=candidates,
-            model=NixDerivation,
-            pk_field="id",
-            label="derivations",
-            batch_size=batch_size,
-            dry_run=dry_run,
-        )
-
-        meta_candidates = NixDerivationMeta.objects.filter(pk__in=meta_ids)
-        self._delete_in_batches(
-            qs=meta_candidates,
-            model=NixDerivationMeta,
-            pk_field="id",
-            label="derivation metas",
-            batch_size=batch_size,
-            dry_run=dry_run,
+        self.stdout.write(
+            self.style.SUCCESS(f"Done. {deleted_metas} derivation metas.")
         )
 
     def _delete_empty_evaluations(
@@ -243,6 +258,7 @@ class Command(BaseCommand):
             pk_field="channel_branch",
             label="channels",
             batch_size=batch_size,
+            dry_run=dry_run,
         )
 
     def _prune_stale_package_attrpaths(self, batch_size: int, dry_run: bool) -> None:
